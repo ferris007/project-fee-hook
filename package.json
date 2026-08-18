@@ -1,0 +1,17 @@
+{
+  "name": "project-fee-hook",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Disclosed immutable 1% project fee hook for Uniswap v4.",
+  "license": "MIT",
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test -vvv"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.6.1",
+    "@openzeppelin/uniswap-hooks": "1.1.1",
+    "@uniswap/v4-core": "1.0.2",
+    "@uniswap/v4-periphery": "1.0.3"
+  }
+}

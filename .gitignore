@@ -1,0 +1,10 @@
+node_modules/
+cache/
+out/
+broadcast/
+surfaces/*/node_modules/
+surfaces/*/build/
+surfaces/*/dist/
+surfaces/*/coverage/
+.programmable/custom-tradable-materialization-receipt.v1.json
+.programmable/project-repair-attempt-*.v1.json
