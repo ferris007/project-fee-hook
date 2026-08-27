@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import { IHooks } from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import { IPoolManager } from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import { CustomRevert } from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import { Hooks } from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import { TickMath } from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import { BalanceDelta } from "@uniswap/v4-core/src/types/BalanceDelta.sol";
@@ -59,6 +60,15 @@ contract ProjectFeeHookTest is Deployers {
     address internal constant TREASURY = address(0xdEAD01);
     address internal constant PROTOCOL = address(0xF0F0);
 
+    uint24 internal constant FEE = 3000;
+    int24 internal constant TICK_SPACING = 60; // what Deployers.initPool derives from a 3000 fee
+
+    /// @dev The permission set the hook declares, and therefore the flag bits its address must carry.
+    uint160 internal constant HOOK_FLAGS = uint160(
+        Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+    );
+
     uint256 internal constant DENOM = 1_000_000;
     uint256 internal constant TOTAL_RATE = 10_000; // 1.00%
     uint256 internal constant PROTOCOL_RATE = 1_000; // 0.10%
@@ -70,16 +80,18 @@ contract ProjectFeeHookTest is Deployers {
         deployFreshManagerAndRouters();
         deployMintAndApprove2Currencies();
 
-        address hookAddress = address(
-            uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG)
-        );
+        address hookAddress = address(HOOK_FLAGS);
+        // The designated pool is bound at deploy time. No circularity: the key's four bound fields are known
+        // before the hook exists, and the fifth field is the hook address itself.
         deployCodeTo(
-            "ProjectFeeHook.sol:ProjectFeeHook", abi.encode(manager, TREASURY, PROTOCOL), hookAddress
+            "ProjectFeeHook.sol:ProjectFeeHook",
+            abi.encode(manager, TREASURY, PROTOCOL, currency0, currency1, FEE, TICK_SPACING),
+            hookAddress
         );
         hook = ProjectFeeHook(hookAddress);
 
         (feeKey,) = initPoolAndAddLiquidity(
-            currency0, currency1, IHooks(hookAddress), 3000, SQRT_PRICE_1_1
+            currency0, currency1, IHooks(hookAddress), FEE, SQRT_PRICE_1_1
         );
 
         handler = new SwapHandler(swapRouter, feeKey);
@@ -94,11 +106,11 @@ contract ProjectFeeHookTest is Deployers {
 
     // --- disclosure ---------------------------------------------------------
 
-    function test_permissionsEnableOnlyBeforeSwapAndItsDelta() public view {
+    function test_permissionsEnableOnlyTheInitializeGateSwapAndItsDelta() public view {
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertTrue(p.beforeSwap, "beforeSwap");
         assertTrue(p.beforeSwapReturnDelta, "beforeSwapReturnDelta");
-        assertFalse(p.beforeInitialize);
+        assertTrue(p.beforeInitialize, "beforeInitialize gates pool attachment");
         assertFalse(p.afterInitialize);
         assertFalse(p.beforeAddLiquidity);
         assertFalse(p.afterAddLiquidity);
@@ -351,6 +363,91 @@ contract ProjectFeeHookTest is Deployers {
         assertEq(hook.totalFeesAccrued(currency0), totalPerSwap * 3, "accounting mirrors the minted claims");
     }
 
+    // --- pool binding --------------------------------------------------------
+
+    /// @dev Builds the exact revert payload core produces when a hook reverts: the hook's own error, wrapped by
+    ///      `CustomRevert.WrappedError`. Asserting the whole envelope proves the gate fired, not merely that
+    ///      initialization failed for some other reason.
+    function _expectUndesignatedPool(PoolKey memory badKey) internal {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(hook),
+                IHooks.beforeInitialize.selector,
+                abi.encodeWithSelector(ProjectFeeHook.UndesignatedPool.selector, badKey.toId()),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+    }
+
+    function test_designatedPoolIsExactlyTheOneBoundAtDeploy() public view {
+        // setUp initialized this pool, so the gate admits the designated key.
+        assertTrue(feeKey.currency0 == hook.designatedCurrency0(), "designated currency0");
+        assertTrue(feeKey.currency1 == hook.designatedCurrency1(), "designated currency1");
+        assertEq(feeKey.fee, hook.designatedFee(), "designated fee");
+        assertEq(feeKey.tickSpacing, hook.designatedTickSpacing(), "designated tick spacing");
+        assertEq(address(feeKey.hooks), address(hook), "the key names this hook");
+    }
+
+    /// @notice v4 initialization is permissionless, so a third party may name this hook in any key. Every key but
+    ///         the designated one is rejected before the pool exists.
+    function test_undesignatedFeeTierCannotAttach() public {
+        PoolKey memory badKey = PoolKey(currency0, currency1, 500, 10, IHooks(address(hook)));
+        _expectUndesignatedPool(badKey);
+        manager.initialize(badKey, SQRT_PRICE_1_1);
+    }
+
+    function test_undesignatedTickSpacingCannotAttach() public {
+        PoolKey memory badKey = PoolKey(currency0, currency1, FEE, 30, IHooks(address(hook)));
+        _expectUndesignatedPool(badKey);
+        manager.initialize(badKey, SQRT_PRICE_1_1);
+    }
+
+    function test_undesignatedCurrencyPairCannotAttach() public {
+        Currency foreign = deployMintAndApproveCurrency();
+        (Currency a, Currency b) = foreign < currency0 ? (foreign, currency0) : (currency0, foreign);
+
+        PoolKey memory badKey = PoolKey(a, b, FEE, TICK_SPACING, IHooks(address(hook)));
+        _expectUndesignatedPool(badKey);
+        manager.initialize(badKey, SQRT_PRICE_1_1);
+    }
+
+    /// @notice The designated pool cannot be re-initialized to reset its price, and the gate is not what stops it:
+    ///         core rejects the duplicate first. Recorded so the two rejections are not confused.
+    function test_designatedPoolCannotBeReinitialized() public {
+        vm.expectRevert();
+        manager.initialize(feeKey, SQRT_PRICE_1_1);
+    }
+
+    /// @dev Deploys the hook's creation code directly. `deployCodeTo` swallows a constructor revert behind its own
+    ///      require string, so the constructor's own error would be invisible through it.
+    function _tryDeployHook(bytes memory args, address where) internal returns (bool ok, bytes memory ret) {
+        vm.etch(where, abi.encodePacked(vm.getCode("ProjectFeeHook.sol:ProjectFeeHook"), args));
+        (ok, ret) = where.call("");
+    }
+
+    /// @notice The designated key is immutable, so a key core could never accept would brick the hook forever.
+    ///         Both such keys are rejected at deploy time instead.
+    function test_constructorRejectsUnsortedDesignatedCurrencies() public {
+        (bool ok, bytes memory ret) = _tryDeployHook(
+            abi.encode(manager, TREASURY, PROTOCOL, currency1, currency0, FEE, TICK_SPACING),
+            address(HOOK_FLAGS | uint160(0x1111 << 20))
+        );
+
+        assertFalse(ok, "an unsortable designated pair must not deploy");
+        assertEq(bytes4(ret), ProjectFeeHook.CurrenciesOutOfOrder.selector, "rejected as out of order");
+    }
+
+    function test_constructorRejectsInvalidDesignatedTickSpacing() public {
+        (bool ok, bytes memory ret) = _tryDeployHook(
+            abi.encode(manager, TREASURY, PROTOCOL, currency0, currency1, FEE, int24(0)),
+            address(HOOK_FLAGS | uint160(0x2222 << 20))
+        );
+
+        assertFalse(ok, "an uninitializable tick spacing must not deploy");
+        assertEq(bytes4(ret), ProjectFeeHook.InvalidTickSpacing.selector, "rejected as invalid tick spacing");
+    }
+
     // --- solvency and claims ------------------------------------------------
 
     function test_hookHoldsNoCustodyAndRecipientsCanRedeemClaims() public {
@@ -444,15 +541,17 @@ contract ProjectFeeHookTest is Deployers {
 
     /// @notice The deployed hook address must encode exactly the permissions it declares, and no others.
     function testDeployment_hookAddressEncodesExactlyTheDeclaredPermissions() public view {
-        uint160 declared =
-            uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
         uint160 encoded = uint160(address(hook)) & uint160(Hooks.ALL_HOOK_MASK);
-        assertEq(encoded, declared, "address flags equal the declared permission set exactly");
+        assertEq(encoded, HOOK_FLAGS, "address flags equal the declared permission set exactly");
 
         // Constructor arguments are bound and immutable.
         assertEq(address(hook.poolManager()), address(manager), "bound PoolManager");
         assertEq(hook.treasury(), TREASURY, "bound treasury");
         assertEq(hook.protocolFeeRecipient(), PROTOCOL, "bound protocol recipient");
+        assertTrue(hook.designatedCurrency0() == currency0, "bound currency0");
+        assertTrue(hook.designatedCurrency1() == currency1, "bound currency1");
+        assertEq(hook.designatedFee(), FEE, "bound fee");
+        assertEq(hook.designatedTickSpacing(), TICK_SPACING, "bound tick spacing");
     }
 
     /// @notice Outstanding recipient claims always reconcile exactly with the hook's own accounting, and the hook

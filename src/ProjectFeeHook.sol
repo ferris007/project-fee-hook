@@ -7,6 +7,7 @@ import { IHooks } from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import { IPoolManager } from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import { FullMath } from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import { Hooks } from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import { TickMath } from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import { BalanceDelta } from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import { BeforeSwapDelta, toBeforeSwapDelta } from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import { Currency } from "@uniswap/v4-core/src/types/Currency.sol";
@@ -39,6 +40,13 @@ import { SwapParams } from "@uniswap/v4-core/src/types/PoolOperation.sol";
 ///
 ///      The total fee is INCLUSIVE, never additive: PROTOCOL_FEE_HUNDREDTHS_OF_BIP is carved out of
 ///      TOTAL_FEE_HUNDREDTHS_OF_BIP rather than added to it. A trader is never charged more than the disclosed total.
+///
+///      Pool binding: v4 initialization is permissionless, so without a gate any third party could create a pool
+///      naming this hook and route swaps through the fee logic. `beforeInitialize` therefore rejects every key
+///      except the designated one. The designated pool is pinned field-by-field as immutables rather than as a
+///      PoolId, because a PoolId hashes the hook's own address and could not be known before deployment. The check
+///      runs once, at initialization, so swaps pay no gas for it. One deployment serves exactly one pool, which is
+///      also what makes `totalFeesAccrued` a truthful per-currency total rather than a figure any pool can inflate.
 contract ProjectFeeHook is BaseHook {
     using SafeCast for *;
 
@@ -57,6 +65,18 @@ contract ProjectFeeHook is BaseHook {
     /// @notice Immutable beneficiary of the inclusive protocol share.
     address public immutable protocolFeeRecipient;
 
+    /// @notice Lower-sorted currency of the one pool permitted to attach to this hook.
+    Currency public immutable designatedCurrency0;
+
+    /// @notice Higher-sorted currency of the one pool permitted to attach to this hook.
+    Currency public immutable designatedCurrency1;
+
+    /// @notice LP fee of the one pool permitted to attach to this hook.
+    uint24 public immutable designatedFee;
+
+    /// @notice Tick spacing of the one pool permitted to attach to this hook.
+    int24 public immutable designatedTickSpacing;
+
     /// @notice Cumulative fee accrued per currency, in that currency's smallest unit.
     mapping(Currency currency => uint256 amount) public totalFeesAccrued;
 
@@ -65,6 +85,9 @@ contract ProjectFeeHook is BaseHook {
     int256 private _pendingResidualPlusOne;
 
     error InvalidRecipient(address recipient);
+    error CurrenciesOutOfOrder(Currency currency0, Currency currency1);
+    error InvalidTickSpacing(int24 tickSpacing);
+    error UndesignatedPool(PoolId attempted);
     error FeeAmountOutOfRange(uint256 amount);
     error PartialFillUnsupported(int256 expectedResidual, int256 executedResidual);
     error PendingSwapInProgress();
@@ -78,18 +101,41 @@ contract ProjectFeeHook is BaseHook {
         uint256 protocolAmount
     );
 
-    constructor(IPoolManager poolManager_, address treasury_, address protocolFeeRecipient_) BaseHook(poolManager_) {
+    constructor(
+        IPoolManager poolManager_,
+        address treasury_,
+        address protocolFeeRecipient_,
+        Currency designatedCurrency0_,
+        Currency designatedCurrency1_,
+        uint24 designatedFee_,
+        int24 designatedTickSpacing_
+    ) BaseHook(poolManager_) {
         if (treasury_ == address(0)) revert InvalidRecipient(treasury_);
         if (protocolFeeRecipient_ == address(0)) revert InvalidRecipient(protocolFeeRecipient_);
+
+        // The designated key is immutable, so a key core could never accept would brick the hook permanently.
+        // Both conditions are re-checked by core at initialize; checking them here fails at deploy time instead.
+        if (!(designatedCurrency0_ < designatedCurrency1_)) {
+            revert CurrenciesOutOfOrder(designatedCurrency0_, designatedCurrency1_);
+        }
+        if (
+            designatedTickSpacing_ < TickMath.MIN_TICK_SPACING
+                || designatedTickSpacing_ > TickMath.MAX_TICK_SPACING
+        ) revert InvalidTickSpacing(designatedTickSpacing_);
+
         treasury = treasury_;
         protocolFeeRecipient = protocolFeeRecipient_;
+        designatedCurrency0 = designatedCurrency0_;
+        designatedCurrency1 = designatedCurrency1_;
+        designatedFee = designatedFee_;
+        designatedTickSpacing = designatedTickSpacing_;
     }
 
     /// @inheritdoc BaseHook
-    /// @dev Every permission starts disabled; only the two required by the confirmed behavior are enabled.
+    /// @dev Every permission starts disabled; only those required by the confirmed behavior are enabled.
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
-            beforeInitialize: false,
+            beforeInitialize: true,
             afterInitialize: false,
             beforeAddLiquidity: false,
             afterAddLiquidity: false,
@@ -116,6 +162,17 @@ contract ProjectFeeHook is BaseHook {
         totalFee = FullMath.mulDiv(specifiedAmount, TOTAL_FEE_HUNDREDTHS_OF_BIP, RATE_DENOMINATOR);
         protocolAmount = FullMath.mulDiv(specifiedAmount, PROTOCOL_FEE_HUNDREDTHS_OF_BIP, RATE_DENOMINATOR);
         treasuryAmount = totalFee - protocolAmount;
+    }
+
+    /// @dev Rejects every pool but the designated one. `key.hooks` is necessarily this contract, since core only
+    ///      dispatches here for keys that name it, so the remaining four fields fully identify the pool.
+    function _beforeInitialize(address, PoolKey calldata key, uint160) internal view override returns (bytes4) {
+        if (
+            !(key.currency0 == designatedCurrency0) || !(key.currency1 == designatedCurrency1)
+                || key.fee != designatedFee || key.tickSpacing != designatedTickSpacing
+        ) revert UndesignatedPool(key.toId());
+
+        return IHooks.beforeInitialize.selector;
     }
 
     function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
