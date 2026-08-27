@@ -1,6 +1,7 @@
 # project-fee-hook
 
-A Uniswap v4 hook that charges one disclosed **1% fee on every swap** and routes it to a treasury.
+A Uniswap v4 hook that charges one disclosed **1% fee on every swap** in **one designated pool** and routes it to a
+treasury.
 
 Unaudited and undeployed. See [Status](#status).
 
@@ -40,7 +41,10 @@ disclose the exact charge before a swap is signed.
   nothing to drain, rescue, or mis-account.
 - **No redirection.** Both recipients are `immutable`, set at deploy. Neither can be changed, and neither can redirect
   the other's share.
-- **Minimum permissions.** Only `beforeSwap` and `beforeSwapReturnDelta` are enabled; the other 12 are disabled.
+- **One pool.** v4 initialization is permissionless, so `beforeInitialize` rejects every key but the designated
+  one. No third party can attach a pool to this hook, and `totalFeesAccrued` is a figure no outside pool can inflate.
+- **Minimum permissions.** Only `beforeInitialize`, `beforeSwap`, `afterSwap` and `beforeSwapReturnDelta` are
+  enabled; the other 10 are disabled.
 
 ## Build and test
 
@@ -51,9 +55,10 @@ npm install     # pins v4-core 1.0.2, v4-periphery 1.0.3, OZ 5.6.1, uniswap-hook
 forge test
 ```
 
-21 tests cover the four swap quadrants, exact-amount preservation, rounding at and below the charge threshold, share
-conservation under fuzzing, unauthorized direct callbacks, pool isolation, single-collection, claim redemption,
-partial-fill reverts, permission-mask encoding in the deployed address, and a reconciliation invariant.
+28 tests cover the four swap quadrants, exact-amount preservation, rounding at and below the charge threshold, share
+conservation under fuzzing, unauthorized direct callbacks, pool isolation, rejection of undesignated pools,
+single-collection, claim redemption, partial-fill reverts, permission-mask encoding in the deployed address, and a
+reconciliation invariant.
 
 ## Status
 
